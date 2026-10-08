@@ -129,31 +129,92 @@ EOF
 # --- D. TidaLuna (Direct Method) ---
 echo -e "${BLUE}::: Patching TidaLuna...${NC}"
 TIDAL_RES="/opt/tidal-hifi/resources"
-TEMP_DIR=$(mktemp -d)
 
-if [ -d "$TIDAL_RES" ]; then
+# A subshell keeps traps and temporary state local to this installation step.
+install_tidaluna() (
+    local temp_dir="" transaction_dir="" committed=0 rollback_failed=0 publish_started=0
+
+    cleanup_tidaluna() {
+        local status=$?
+        trap - EXIT HUP INT TERM
+        if [ -n "$transaction_dir" ]; then
+            if [ "$committed" -eq 0 ]; then
+                if [ "$publish_started" -eq 1 ] && sudo test ! -e "$transaction_dir/new-app"; then
+                    sudo rm -rf -- "$TIDAL_RES/app" || rollback_failed=1
+                fi
+                # Look for saved files rather than flags: a signal may arrive
+                # immediately after a successful move.
+                if sudo test -e "$transaction_dir/previous-app"; then
+                    sudo mv -T -- "$transaction_dir/previous-app" "$TIDAL_RES/app" || rollback_failed=1
+                fi
+                if sudo test -e "$transaction_dir/previous.asar"; then
+                    sudo mv -T -- "$transaction_dir/previous.asar" "$TIDAL_RES/app.asar" || rollback_failed=1
+                fi
+            fi
+            if [ "$rollback_failed" -eq 1 ]; then
+                echo "    -> Rollback failed; recovery files retained at $transaction_dir" >&2
+                status=1
+            else
+                sudo rm -rf -- "$transaction_dir" || {
+                    echo "    -> Could not clean staging directory: $transaction_dir" >&2
+                }
+            fi
+        fi
+        if [ -n "$temp_dir" ]; then
+            rm -rf -- "$temp_dir" || echo "    -> Could not clean download directory: $temp_dir" >&2
+        fi
+        exit "$status"
+    }
+    trap cleanup_tidaluna EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    if [ ! -d "$TIDAL_RES" ]; then
+        echo -e "${YELLOW}    -> Tidal directory not found.${NC}"
+        return 0
+    fi
+    temp_dir=$(mktemp -d) || return 1
     echo "    -> Downloading Luna..."
-    curl -L -o "$TEMP_DIR/luna.zip" https://github.com/Inrixia/TidaLuna/releases/latest/download/luna.zip
-    
-    # Backup
-    if [ -f "$TIDAL_RES/app.asar" ] && [ ! -f "$TIDAL_RES/original.asar" ]; then
-        echo "    -> Creating backup..."
-        sudo mv "$TIDAL_RES/app.asar" "$TIDAL_RES/original.asar"
+    curl --fail --location --show-error -o "$temp_dir/luna.zip" \
+        https://github.com/Inrixia/TidaLuna/releases/latest/download/luna.zip || return 1
+    unzip -tq "$temp_dir/luna.zip" || return 1
+
+    echo "    -> Extracting..."
+    mkdir -- "$temp_dir/app" || return 1
+    unzip -q "$temp_dir/luna.zip" -d "$temp_dir/app" || return 1
+    # Reject empty archives and archives with an unexpected top-level layout.
+    if [ ! -s "$temp_dir/app/package.json" ]; then
+        echo "    -> Luna archive is missing package.json." >&2
+        return 1
     fi
 
-    # Clean & Install
-    if [ -d "$TIDAL_RES/app" ]; then
-        sudo rm -rf "$TIDAL_RES/app"
+    # Stage on the target filesystem before touching any installed files.
+    transaction_dir=$(sudo mktemp -d "$TIDAL_RES/.tidaluna.XXXXXX") || return 1
+    sudo cp -a -- "$temp_dir/app" "$transaction_dir/new-app" || return 1
+    sudo chown -R root:root -- "$transaction_dir/new-app" || return 1
+
+    # Copy the pristine backup first; never overwrite an existing original.
+    if [ -f "$TIDAL_RES/app.asar" ] && [ ! -e "$TIDAL_RES/original.asar" ]; then
+        echo "    -> Creating backup..."
+        sudo cp -a -- "$TIDAL_RES/app.asar" "$transaction_dir/original.asar" || return 1
+        sudo mv -T -- "$transaction_dir/original.asar" "$TIDAL_RES/original.asar" || return 1
     fi
-    
-    echo "    -> Extracting..."
-    sudo mkdir -p "$TIDAL_RES/app"
-    sudo unzip -q -o "$TEMP_DIR/luna.zip" -d "$TIDAL_RES/app"
-    
+    if [ -e "$TIDAL_RES/app" ]; then
+        sudo mv -T -- "$TIDAL_RES/app" "$transaction_dir/previous-app" || return 1
+    fi
+    if [ -e "$TIDAL_RES/app.asar" ]; then
+        sudo mv -T -- "$TIDAL_RES/app.asar" "$transaction_dir/previous.asar" || return 1
+    fi
+    publish_started=1
+    sudo mv -T -- "$transaction_dir/new-app" "$TIDAL_RES/app" || return 1
+    committed=1
     echo -e "${GREEN}    -> TidaLuna Patched.${NC}"
-    rm -rf "$TEMP_DIR"
-else
-    echo -e "${YELLOW}    -> Tidal directory not found.${NC}"
+)
+
+if ! install_tidaluna; then
+    echo -e "${RED}    -> TidaLuna installation failed. Check the errors above.${NC}" >&2
+    exit 1
 fi
 
 # ------------------------------------------------------
